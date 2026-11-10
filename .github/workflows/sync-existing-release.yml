@@ -1,0 +1,29 @@
+name: 同步已有安装包
+
+on:
+  workflow_dispatch:
+    inputs:
+      transfer:
+        description: '已发布原包的版本、SHA256及GitHub官方临时文件地址；不接受源码或API令牌'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: public-package-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: 搬运原包并发布
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node .github/scripts/sync-existing-release.mjs
