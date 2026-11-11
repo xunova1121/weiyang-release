@@ -4,10 +4,14 @@ import argparse
 import getpass
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import sys
+import subprocess
+import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -122,6 +126,7 @@ def download_asset(token, asset, directory):
     require(asset['state'] == 'uploaded' and asset['size'] == size and asset.get('digest') == 'sha256:' + expected_hash,
             '源发布附件与已确认原包不一致')
     endpoint = SOURCE_API + f'/releases/assets/{int(asset["id"])}'
+    print('正在连接原包下载：' + asset['name'], flush=True)
     req = urllib.request.Request(endpoint, headers={'Authorization': 'Bearer ' + token,
                                  'Accept': 'application/octet-stream', 'User-Agent': 'weiyang-direct-release'})
     try:
@@ -138,15 +143,19 @@ def download_asset(token, asset, directory):
     request = urllib.request.Request(location, headers={'User-Agent': 'weiyang-direct-release'})
     path = directory / asset['name']
     hasher, total = hashlib.sha256(), 0
+    last_progress = time.monotonic()
     with urllib.request.build_opener(NoRedirect).open(request, timeout=180) as response, path.open('xb') as output:
         while True:
-            chunk = response.read(1024 * 1024)
+            chunk = response.read(64 * 1024)
             if not chunk:
                 break
             total += len(chunk)
             require(total <= size, '原包超过声明大小，已停止下载')
             hasher.update(chunk)
             output.write(chunk)
+            if time.monotonic() - last_progress >= 2:
+                print(f'下载进度：{total / 1048576:.1f} / {size / 1048576:.1f} MB', flush=True)
+                last_progress = time.monotonic()
     require(total == size and hasher.hexdigest() == expected_hash, '下载原包摘要不一致，未发布')
     print('已下载并核对：' + asset['name'], flush=True)
 
@@ -166,6 +175,90 @@ def prepare_local(token):
     (directory / 'manual-release-files.json').write_text(json.dumps(manifest, ensure_ascii=False))
     (directory / 'manual-release-notes.md').write_text(source.get('body') or '')
     return directory
+
+
+def server_preflight():
+    require(os.geteuid() == 0, '服务器更新需要root用户')
+    base = Path('/opt/jarvis')
+    require((base / 'jarvis.env').is_file(), '未发现既有服务器配置；本工具仅升级，不初始化账号')
+    require((base / 'current/VERSION').is_file(), '找不到既有服务器版本，未修改服务')
+    current = (base / 'current/VERSION').read_text().strip()
+    require(re.fullmatch(r'1\.0\.\d+', current), '现有版本无法确认，未修改服务')
+    if int(current.split('.')[-1]) >= 416:
+        print(f'当前服务器文件版本为{current}，无需下载或回退到1.0.416。')
+        return False
+    print(f'服务器当前版本：{current}；本次只更新服务器到{VERSION}。', flush=True)
+    return True
+
+
+def install_server(token):
+    import fcntl
+    source = request_json(token, SOURCE_API + '/releases/tags/desktop-v' + VERSION)
+    require(not source['draft'] and not source['prerelease'] and source.get('published_at')
+            and source['target_commitish'] == SOURCE_COMMIT, '源版本不是已确认的1.0.416')
+    name = f'jarvis-server-{VERSION}.tar.gz'
+    asset = next((item for item in source['assets'] if item['name'] == name), None)
+    require(asset, '源发布缺少服务器安装包')
+    directory = Path(tempfile.mkdtemp(prefix='weiyang-server-1.0.416-', dir=Path.cwd()))
+    print('仅下载服务器包，保存目录：' + str(directory), flush=True)
+    download_asset(token, asset, directory)
+    package = directory / name
+    # 已核对完整原包SHA256，只读取固定的两个部署脚本，不解压任意路径。
+    with tarfile.open(package, 'r:gz') as archive:
+        def deployment_file(filename):
+            member = archive.getmember('jarvis-server/deploy/' + filename)
+            require(member.isfile() and member.size < 256 * 1024, '部署脚本格式异常')
+            return archive.extractfile(member).read()
+        installer_bytes = deployment_file('install.sh')
+        updater_bytes = deployment_file('update.sh')
+    anchor = 'if [[ "$VER" == "$CUR" ]]; then status latest "已经是最新版 $CUR" "$CUR"; exit 0; fi'
+    updater = updater_bytes.decode('utf8')
+    require(updater.count(anchor) == 1, '未识别原更新脚本，未安装，防止回退保护失效')
+    guard = '''
+# 手动升级后公开源可能仍是旧版；只允许前向更新，不能把416降回415。
+if [[ "$CUR" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ && "$VER" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ ]]; then
+  if [[ "$(printf '%s\\n%s\\n' "$VER" "$CUR" | sort -V | head -n 1)" == "$VER" ]]; then
+    status latest "已安装 $CUR，公开源 $VER 较旧，保留当前版本" "$CUR"
+    exit 0
+  fi
+fi
+'''
+    patched_updater = updater.replace(anchor, anchor + '\n' + guard).encode('utf8')
+    installer = directory / 'install.sh'
+    installer.write_bytes(installer_bytes)
+    base = Path('/opt/jarvis')
+    with (base / '.update.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise StopPublish('已有服务器更新正在执行；原包已下载，未启动第二次安装') from None
+        if not server_preflight():
+            return
+        # 保留旧版本路径以便人工恢复；不读取jarvis.env或用户数据。
+        previous = str((base / 'current').resolve())
+        (directory / 'previous-app.txt').write_text(previous + '\n')
+        print('原包已核对，开始安装依赖并升级；最后会短暂重启未央。', flush=True)
+        env = {**os.environ, 'JARVIS_NO_OFFICE': '1', 'JARVIS_NO_FFMPEG': '1',
+               'npm_config_fetch_timeout': '60000', 'npm_config_fetch_retries': '1'}
+        result = subprocess.run(['bash', str(installer), str(package)], env=env)
+        installed = (base / 'current/VERSION').read_text().strip()
+        if installed == VERSION:
+            # 安装器会启用定时更新；在持有同一更新锁时补上保护，再放行后续更新。
+            live_updater = base / 'update.sh'
+            require(live_updater.read_bytes() == updater_bytes, '更新脚本已被其他进程改动，未覆盖')
+            # 发布目录可能不在同一文件系统；先在目标目录建立临时文件再原子替换。
+            handle, staging = tempfile.mkstemp(prefix='.update-forward-', dir=base)
+            try:
+                with os.fdopen(handle, 'wb') as output:
+                    output.write(patched_updater)
+                os.chmod(staging, 0o755)
+                os.replace(staging, live_updater)
+            finally:
+                if os.path.exists(staging):
+                    os.unlink(staging)
+            print('已加版本回退保护：公开源415不会覆盖当前416。', flush=True)
+        require(result.returncode == 0 and installed == VERSION, '安装未确认成功；请保留终端输出及previous-app.txt，不要重复重装')
+        print('服务器1.0.416安装及启动检查完成；手机和Windows安装包未升级。', flush=True)
 
 
 def matches(actual, expected):
@@ -221,16 +314,22 @@ def publish(directory, token):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--directory', type=Path, help='已有完整原包目录；省略则从已发布版本下载')
+    parser.add_argument('--server-only', action='store_true', help='只下载约27MB服务器原包并安装，短暂重启服务')
     args = parser.parse_args()
     try:
         # 只在用户自己的真实终端隐藏输入；凭据不进shell历史、环境变量、文件或聊天。
         require(sys.stdin.isatty(), '请在自己的交互终端执行脚本，不能通过管道输入令牌')
+        if args.server_only and not server_preflight():
+            sys.exit(0)
         warnings.simplefilter('error', getpass.GetPassWarning)
         credential = getpass.getpass('粘贴GitHub发布令牌后回车（输入不显示）：').strip()
         require(credential, '未输入令牌，未请求')
-        directory = args.directory.resolve() if args.directory else prepare_local(credential)
-        publish(directory, credential)
-        print('三端原包已公开发布。设备仍需分别更新；令牌可以在GitHub中撤销。')
+        if args.server_only:
+            install_server(credential)
+        else:
+            directory = args.directory.resolve() if args.directory else prepare_local(credential)
+            publish(directory, credential)
+            print('三端原包已公开发布。设备仍需分别更新；令牌可以在GitHub中撤销。')
     except StopPublish as error:
         print(str(error), file=sys.stderr)
         sys.exit(1)
